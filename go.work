@@ -3,6 +3,7 @@ go 1.24.2
 use (
 	.
 	./auth-server
+	./contract-server
 	./gateway-server
 	./orchestrator-server
 )

@@ -4,7 +4,7 @@ WORKDIR /build_file
 COPY . ./
 RUN go work sync
 RUN go mod download
-RUN CGO_ENABLE=0 GOOS=linux go build -a -o app -installsuffix _f7r -ldflags '-extldflags "-static"' ./orchestrator-server/cmd/orchestrator-server/main.go
+RUN CGO_ENABLE=0 GOOS=linux go build -a -o app -installsuffix _f7r -ldflags '-extldflags "-static"' ./auth-server/cmd/auth-server/main.go
 
 FROM alpine:latest
 COPY --from=build_image ./build_file/app ./
