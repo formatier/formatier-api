@@ -18,10 +18,14 @@ func NewConnection() *Connection {
 }
 
 type Connection struct {
-	mx           sync.Mutex
+	mx           sync.RWMutex
 	amqpConn     *amqp.Connection
 	amqpMainChan *amqp.Channel
 	consumers    []*Consumer
+
+	isConnected    bool
+	reconnectDelay time.Duration
+	maxRetryDelay  time.Duration
 }
 
 func (conn *Connection) AutoConnect(ctx context.Context, path string, amqpConfig *amqp.Config) {
@@ -29,79 +33,131 @@ func (conn *Connection) AutoConnect(ctx context.Context, path string, amqpConfig
 		amqpConfig = &amqp.Config{}
 	}
 
-	amqpConn, err := amqp.DialConfig(path, *amqpConfig)
+	conn.reconnectDelay = 2 * time.Second
+	conn.maxRetryDelay = 30 * time.Second
+
+	err := conn.connect(path, amqpConfig)
 	if err != nil {
 		panic(fmt.Sprintf("Error on first connection %v", err))
 	}
-	conn.amqpConn = amqpConn
 
-	conn.amqpMainChan, err = amqpConn.Channel()
-	if err != nil {
-		log.Println("Error when tring to connect: %w", err)
+	go conn.monitorConnection(ctx, path, amqpConfig)
+}
+
+func (conn *Connection) connect(path string, amqpConfig *amqp.Config) error {
+	conn.mx.Lock()
+	defer conn.mx.Unlock()
+
+	if conn.amqpConn != nil && !conn.amqpConn.IsClosed() {
+		conn.amqpConn.Close()
 	}
 
-	reconnectChan := make(chan struct{})
+	amqpConn, err := amqp.DialConfig(path, *amqpConfig)
+	if err != nil {
+		return fmt.Errorf("failed to dial: %w", err)
+	}
 
-	go func() {
-		for {
-			select {
-			case <-amqpConn.NotifyClose(make(chan *amqp.Error)):
-				fmt.Println("Noticed close, waiting for 2 seconds, please wait...")
-				if amqpConn.IsClosed() {
-					reconnectChan <- struct{}{}
-				}
-				time.Sleep(2 * time.Second)
-			case <-ctx.Done():
-				conn.amqpMainChan.Close()
-				close(reconnectChan)
-				return
-			}
+	amqpMainChan, err := amqpConn.Channel()
+	if err != nil {
+		amqpConn.Close()
+		return fmt.Errorf("failed to create main channel: %w", err)
+	}
+
+	conn.amqpConn = amqpConn
+	conn.amqpMainChan = amqpMainChan
+	conn.isConnected = true
+
+	log.Println("Successfully connected to RabbitMQ")
+	return nil
+}
+
+func (conn *Connection) monitorConnection(ctx context.Context, path string, amqpConfig *amqp.Config) {
+	for {
+		conn.mx.RLock()
+		currentConn := conn.amqpConn
+		conn.mx.RUnlock()
+
+		if currentConn == nil {
+			time.Sleep(5 * time.Second)
+			continue
 		}
-	}()
 
-	go func() {
-		for range reconnectChan {
-			log.Println("Waiting for new connection, please wait...")
+		closeNotify := make(chan *amqp.Error, 1)
+		currentConn.NotifyClose(closeNotify)
+
+		select {
+		case err := <-closeNotify:
+			if err != nil {
+				log.Printf("Connection closed: %v", err)
+			} else {
+				log.Println("Connection closed gracefully")
+			}
+
 			conn.mx.Lock()
-
-			log.Println("Connecting to server...")
-			amqpConn, err := amqp.DialConfig(path, *amqpConfig)
-			if err != nil {
-				log.Printf("Cannot reconnect to server: %s", err)
-				amqpConn.Close()
-				conn.mx.Unlock()
-				continue
-			}
-			log.Println("Successfully connected to server!")
-
-			log.Println("Creating a new main chanel.")
-			amqpMainChan, err := amqpConn.Channel()
-			if err != nil {
-				log.Printf("Cannot reconnect to server: %s", err)
-				amqpConn.Close()
-				conn.mx.Unlock()
-				continue
-			}
-			log.Println("Successfully created a new main chanel!")
-
-			log.Println("Reconsuming comsumers...")
-			for _, consumer := range conn.consumers {
-				err := consumer.Reconnect(amqpConn)
-				if err != nil {
-					log.Printf("Cannot reconnect to server: %s", err)
-					conn.mx.Unlock()
-					continue
-				}
-			}
-			log.Println("Successfully recomsumed consumers!")
-
-			conn.amqpConn = amqpConn
-			conn.amqpMainChan = amqpMainChan
-
-			fmt.Println("Successfully reconnected")
+			conn.isConnected = false
 			conn.mx.Unlock()
+
+			go conn.handleReconnect(ctx, path, amqpConfig)
+			return
+		case <-ctx.Done():
+			log.Println("Context cancelled, stopping connection monitor")
+			conn.mx.Lock()
+			if conn.amqpMainChan != nil {
+				conn.amqpMainChan.Close()
+			}
+			if conn.amqpConn != nil {
+				conn.amqpConn.Close()
+			}
+			conn.mx.Unlock()
+			return
 		}
-	}()
+	}
+}
+
+func (conn *Connection) handleReconnect(ctx context.Context, path string, amqpConfig *amqp.Config) {
+	retryDelay := conn.reconnectDelay
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		default:
+		}
+
+		log.Printf("Attempting to reconnect in %v...", retryDelay)
+		time.Sleep(retryDelay)
+
+		log.Println("Connecting to server...")
+		err := conn.connect(path, amqpConfig)
+		if err != nil {
+			log.Printf("Failed to reconnect: %v", err)
+
+			retryDelay = min(retryDelay*2, conn.maxRetryDelay)
+			continue
+		}
+
+		log.Println("Successfully reconnected!")
+
+		conn.mx.RLock()
+		consumers := make([]*Consumer, len(conn.consumers))
+		copy(consumers, conn.consumers)
+
+		currentConn := conn.amqpConn
+		conn.mx.RUnlock()
+
+		log.Println("Reconnecting consumers...")
+		for i, consumer := range consumers {
+			err := consumer.Reconnect(currentConn)
+			if err != nil {
+				log.Printf("Failed to reconnect consumer %d: %v", i, err)
+				continue
+			}
+		}
+		log.Println("Successfully reconnected all consumers!")
+
+		go conn.monitorConnection(ctx, path, amqpConfig)
+		return
+	}
 }
 
 type ExchangeConfig struct {
