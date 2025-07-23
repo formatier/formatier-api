@@ -6,11 +6,17 @@ import (
 
 type CommandRequestSchema struct {
 	CommandID     string                                   `json:"command_id"`
-	Payload       string                                   `json:"payload"`
+	Payload       any                                      `json:"payload"`
 	TimeoutPolicy service.UniversalSagaTimeoutPolicySchema `json:"timeout_policy"`
 }
 
-var (
-	TIMEOUT_MODE_PROMISE  = "promise"
+type CommandResponseSchema struct {
+	CommandID string `json:"command_id"`
+	Response  any    `json:"payload"`
+	Status    string `json:"status"`
+}
+
+const (
+	TIMEOUT_MODE_FUTURE   = "future"
 	TIMEOUT_MODE_ROLLBACK = "rollback"
 )

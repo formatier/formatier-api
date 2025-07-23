@@ -4,7 +4,7 @@ type OAuthAccountSchema struct {
 	Email        string
 	AccessToken  string
 	RefreshToken string
-	ProviderId   string
+	ProviderID   string
 	Provider     string
 }
 
@@ -16,7 +16,7 @@ type AuthCookieSchema struct {
 type AuthTokenSchema struct {
 	Issuer  string   `json:"iss"`
 	Subject string   `json:"sub"`
-	TokenId string   `json:"jti,omitempty"`
+	TokenID string   `json:"jti,omitempty"`
 	Email   string   `json:"email"`
 	Audince []string `json:"aud"`
 	Expiry  uint64   `json:"exp"`
